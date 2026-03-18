@@ -6,6 +6,11 @@ In the current test form, run the script with the following instructions. The jo
 
 ```bash
 bash postscript.sh <jobID>
+optional flags
+--format text|csv|json
+--help
+--no-csv-header
+ --quiet
 ```
 Please avoid running the script in a loop with many iterations as this will likely stress SLURM and result in a slowdown on the system for other users.
 
