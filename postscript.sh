@@ -1,5 +1,5 @@
 #!/bin/bash -l
-# Usage: ./jobsummary_updated.sh <jobid> [--format text|csv|json] [--no-csv-header] [--quiet]
+# Usage: ./job_usage.sh <jobid> [--format text|csv|json] [--no-csv-header] [--quiet]
 
 usage() {
     echo "Usage: $0 <jobid> [--format text|csv|json] [--no-csv-header] [--quiet]"
@@ -129,6 +129,9 @@ convert_to_gb() {
 
     # Convert to GB
     case "$mem_unit" in
+        b)
+            echo "$(echo "scale=6; $mem_value / 1024 / 1024 / 1024" | bc -l)"
+            ;;
         k|kb)
             echo "$(echo "scale=6; $mem_value / 1024 / 1024" | bc -l)"
             ;;
@@ -204,9 +207,24 @@ format_memory() {
         # Sub-GB values: show MB with at most 2 decimal places.
         mem_mb=$(echo "scale=4; $mem_gb * 1024" | bc)
         awk -v mb="$mem_mb" 'BEGIN { printf "%.2fMB", mb }' | sed -E 's/\.?0+MB$/MB/'
+    elif (( $(echo "$mem_gb >= 1024" | bc -l) )); then
+        # 1 TB or more: show TB with up to 2 decimal places.
+        mem_tb=$(echo "scale=4; $mem_gb / 1024" | bc)
+        awk -v tb="$mem_tb" 'BEGIN { printf "%.2fTB", tb }' | sed -E 's/(\.[0-9]*[1-9])0+TB$/\1TB/; s/\.00TB$/TB/'
     else
         # 1 GB or more: show GB with up to 2 decimal places.
         awk -v gb="$mem_gb" 'BEGIN { printf "%.2fGB", gb }' | sed -E 's/(\.[0-9]*[1-9])0+GB$/\1GB/; s/\.00GB$/GB/'
+    fi
+}
+
+# Helper: format walltime suggestion in hours or minutes
+format_walltime_suggest() {
+    local hours=$1
+    if (( $(echo "$hours < 1" | bc -l) )); then
+        local mins=$(awk -v h="$hours" 'BEGIN { printf "%d", h * 60 + 0.5 }')
+        echo "${mins} minutes"
+    else
+        echo "${hours} hours"
     fi
 }
 
@@ -243,7 +261,7 @@ json_num_or_null() {
 
 # --- Job data --- #
 # Fetch job data from sacct
-FIELDS="JobID,Account,State,ExitCode,Partition,ReqCPUS,AllocCPUS,TotalCPU,ReqMem,ReqTRES,AllocTRES,Timelimit,Elapsed,NNodes,NodeList,MaxRSS,CPUtime,CPUTimeRAW,Submit,Start,End"
+FIELDS="JobID,Account,State,ExitCode,Partition,ReqCPUS,AllocCPUS,TotalCPU,ReqMem,AllocTRES,Timelimit,Elapsed,NNodes,AveRSS,NTasks,CPUtime,CPUTimeRAW,Submit,Start,End"
 
 # Force standard timestamp formatting so Submit/Start/End include date and time.
 JOB_DATA=$(SLURM_TIME_FORMAT=standard sacct -n -j "$JOBID" --format="$FIELDS" -P)
@@ -269,8 +287,7 @@ for line in "${LINES[@]}"; do
 done
 [ -z "$job_line" ] && job_line="${LINES[0]}"
 
-IFS='|' read -r jobid account state exitcode partition reqcpus alloccpus totalcpu reqmem reqtres alloctres timelimit elapsed nnodes nodelist maxrss cputime cputimeraw submit_time start_time end_time <<< "$job_line"
-
+IFS='|' read -r jobid account state exitcode partition reqcpus alloccpus totalcpu reqmem alloctres timelimit elapsed nnodes averss ntasks cputime cputimeraw submit_time start_time end_time <<< "$job_line"
 # Normalize missing sacct timestamps
 for ts_var in submit_time start_time end_time; do
     ts_val="${!ts_var}"
@@ -341,23 +358,30 @@ fi
 # -------------------------------- #
 
 # --- Memory usage and efficiency --- #
-# Collect maximum memory across ALL job steps from the existing JOB_DATA payload.
-max_memory_all=""
+# AveRSS is the average memory across tasks within a step.
+# Multiply AveRSS × NTasks to get total job memory (matches seff methodology).
 max_memory_all_gb="0"
 for line in "${LINES[@]}"; do
     [ -z "$line" ] && continue
-    IFS='|' read -r _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ line_maxrss _ _ <<< "$line"
-    line_maxrss=$(echo "$line_maxrss" | tr -d '[:space:]')
+    IFS='|' read -r _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ line_averss line_ntasks _ _ <<< "$line"
+    line_averss=$(echo "$line_averss" | tr -d '[:space:]')
 
     # Ignore empty/non-numeric placeholders returned by sacct.
-    if ! echo "$line_maxrss" | grep -Eq '^[0-9]+([.][0-9]+)?[[:alpha:]]*[cn]?$'; then
+    if ! echo "$line_averss" | grep -Eq '^[0-9]+([.][0-9]+)?[[:alpha:]]*[cn]?$'; then
         continue
     fi
 
-    line_maxrss_gb=$(convert_to_gb "$line_maxrss" "kb")
-    if (( $(echo "$line_maxrss_gb > $max_memory_all_gb" | bc -l) )); then
-        max_memory_all="$line_maxrss"
-        max_memory_all_gb="$line_maxrss_gb"
+    line_averss_gb=$(convert_to_gb "$line_averss" "b")
+
+    # Scale by number of tasks to get total memory for this step
+    if [[ "$line_ntasks" =~ ^[0-9]+$ ]] && [ "$line_ntasks" -gt 0 ]; then
+        line_total_gb=$(echo "scale=6; $line_averss_gb * $line_ntasks" | bc -l)
+    else
+        line_total_gb="$line_averss_gb"
+    fi
+
+    if (( $(echo "$line_total_gb > $max_memory_all_gb" | bc -l) )); then
+        max_memory_all_gb="$line_total_gb"
     fi
 done
 
@@ -368,7 +392,7 @@ if ! [[ "$reqcpus_for_mem" =~ ^[0-9]+$ ]] || [ "$reqcpus_for_mem" -le 0 ]; then
 fi
 mem_requested_gb=$(reqmem_to_total_gb "$reqmem" "$reqcpus_for_mem" "$nnodes")
 
-# Used memory (MaxRSS)
+# Used memory (AveRSS)
 mem_used_gb="$max_memory_all_gb"
 
 # Calculate memory efficiency as percentage
@@ -388,33 +412,34 @@ case "$partition" in
     *highmem*)
         partition_type="highmem"
         charge_rate=128
-        node_mem_gb=1011
+        node_mem_gb=980
         node_cores=128
         ;;
     *copy*)
         partition_type="copy"
-        charge_rate=128
-        node_mem_gb=235
+        charge_rate=0
+        node_mem_gb=115
         node_cores=64
         ;;    
     *)
         partition_type="cpu"
         charge_rate=128
-        node_mem_gb=235
+        node_mem_gb=230
         node_cores=128
         ;;
 esac
 
 # Calculate service units (SUs) based on partition type
 if [[ "$partition_type" == "gpu" ]]; then
-    gpu_proportion=$(awk -v g="$ngpus_alloc" -v n="$node_gpus" 'BEGIN { if (n>0) printf "%.6f", g/n; else print 0 }')
+    gpu_proportion=$(awk -v g="$ngpus_alloc" -v nn="$nnodes" -v n="$node_gpus" 'BEGIN { if (n>0) printf "%.6f", (g/nn)/n; else print 0 }')
     service_units=$(awk -v rate="$charge_rate" -v prop="$gpu_proportion" -v n="$nnodes" -v hrs="$elapsed_hours" \
-        'BEGIN { printf "%.4f", rate * prop * n * hrs }')
+    'BEGIN { printf "%.4f", rate * prop * n * hrs }')
 else
 
 # Calculate core and mem proportions, determine which is higher to use for SU calculation
-    cores_proportion=$(awk -v a="$alloccpus_no_hyperthreading" -v n="$node_cores" 'BEGIN { printf "%.6f", a/n }')
-    mem_proportion=$(awk -v u="$mem_requested_gb" -v n="$node_mem_gb" 'BEGIN { p=u/n; if (p>1) p=1; printf "%.6f", p }')
+
+    cores_proportion=$(awk -v a="$alloccpus_no_hyperthreading" -v nn="$nnodes" -v n="$node_cores" 'BEGIN { printf "%.6f", (a/nn)/n }')
+    mem_proportion=$(awk -v u="$mem_requested_gb" -v nn="$nnodes" -v n="$node_mem_gb" 'BEGIN { p=(u/nn)/n; if (p>1) p=1; printf "%.6f", p }')
     max_proportion=$(awk -v c="$cores_proportion" -v m="$mem_proportion" 'BEGIN { if (c>m) printf "%.6f", c; else printf "%.6f", m }')
 
     # --- SU calculation ---
@@ -575,12 +600,14 @@ fi
 if [ -n "$memory_efficiency" ] && [ "$memory_efficiency" != "N/A" ]; then
     if (( $(echo "$memory_efficiency < 10" | bc -l) )); then
         mem_suggest=$(echo "($mem_used_gb * 1.5 + 0.999)/1" | bc)
+        mem_suggest_fmt=$(format_memory "$mem_suggest")
         echo "    VERY LOW MEMORY EFFICIENCY (<10%)"
-        echo "   - Consider reducing memory request to ~${mem_suggest}GB for similar jobs"
+        echo "   - Consider reducing memory request to ~${mem_suggest_fmt} for similar jobs"
     elif (( $(echo "$memory_efficiency < 50" | bc -l) )); then
         mem_suggest=$(echo "($mem_used_gb * 1.5 + 0.999)/1" | bc) 
+        mem_suggest_fmt=$(format_memory "$mem_suggest")
         echo "    LOW MEMORY EFFICIENCY (<50%)"
-        echo "   - Consider reducing memory request to ~${mem_suggest}GB for similar jobs"
+        echo "   - Consider reducing memory request to ~${mem_suggest_fmt} for similar jobs"
     elif (( $(echo "$memory_efficiency < 98" | bc -l) )); then
         echo "    GOOD MEMORY EFFICIENCY (>50% and <98%)"
         echo "   - Good use of the requested memory"
@@ -616,16 +643,16 @@ fi
 if (( $(echo "$walltime_efficiency < 30" | bc) )); then
         walltime_suggest=$(awk -v e="$elapsed_hours" 'BEGIN { printf "%.2f", e * 1.5 }')
         echo "    VERY LOW WALLTIME USAGE (<30% of requested)"
-        echo "     - Consider reducing walltime limit to around ~${walltime_suggest} hours for similar jobs"
+        echo "     - Consider reducing walltime limit to around ~$(format_walltime_suggest "$walltime_suggest") for similar jobs"
     elif (( $(echo "$walltime_efficiency < 60" | bc) )); then
         walltime_suggest=$(awk -v e="$elapsed_hours" 'BEGIN { printf "%.2f", e * 1.5 }')
         echo "    LOW WALLTIME USAGE (30-60% of requested)"
-        echo "     - Consider reducing walltime limit to around ~${walltime_suggest} hours for similar jobs"
+        echo "     - Consider reducing walltime limit to around ~$(format_walltime_suggest "$walltime_suggest") for similar jobs"
     elif (( $(echo "$walltime_efficiency < 80" | bc) )); then
         walltime_suggest=$(awk -v e="$elapsed_hours" 'BEGIN { printf "%.2f", e * 1.5 }')
         echo "    MODERATE WALLTIME USAGE (60-80% of requested)"
         echo "     - Check if job is waiting on resources or has long idle periods"
-        echo "     - Consider reducing walltime limit to around ~${walltime_suggest} hours if there is consistent unused time across jobs"
+        echo "     - Consider reducing walltime limit to around ~$(format_walltime_suggest "$walltime_suggest") if there is consistent unused time across jobs"
     elif (( $(echo "$walltime_efficiency < 100" | bc) )); then
         echo "    GOOD WALLTIME USAGE (80-100% of requested)"
         echo "     - Reasonable use of allocated walltime"
