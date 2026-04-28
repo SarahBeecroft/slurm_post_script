@@ -363,7 +363,7 @@ fi
 max_memory_all_gb="0"
 for line in "${LINES[@]}"; do
     [ -z "$line" ] && continue
-    IFS='|' read -r _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ line_averss line_ntasks _ _ <<< "$line"
+    IFS='|' read -r _ _ _ _ _ _ _ _ _ _ _ _ _ line_averss line_ntasks _ _ _ _ _ <<< "$line"
     line_averss=$(echo "$line_averss" | tr -d '[:space:]')
 
     # Ignore empty/non-numeric placeholders returned by sacct.
